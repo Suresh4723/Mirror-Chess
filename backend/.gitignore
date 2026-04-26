@@ -1,0 +1,33 @@
+# ---------------- PYTHON ----------------
+__pycache__/
+*.pyc
+*.pyo
+
+# ---------------- VENV ----------------
+.venv/
+venv/
+env/
+
+# ---------------- DATA ----------------
+*.csv
+*.pkl
+
+# keep JSON if you want (important)
+# !cleaned_games.json
+
+# ---------------- NOTEBOOK ----------------
+.ipynb_checkpoints/
+
+# ---------------- CACHE ----------------
+.cache/
+*.log
+
+# ---------------- OS ----------------
+.DS_Store
+
+# ---------------- IDE ----------------
+.vscode/
+.idea/
+
+# ---------------- ENV ----------------
+.env
