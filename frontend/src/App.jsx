@@ -146,7 +146,7 @@ export default function App() {
     try {
       setLoading(true);
 
-      const res = await axios.post("http://127.0.0.1:8000/predict", {
+      const res = await axios.post(`${import.meta.env.VITE_API_URL}/predict`, {
         fen: gameObj.fen(),
         moves: history,
       });
