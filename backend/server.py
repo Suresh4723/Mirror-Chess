@@ -53,7 +53,7 @@ class ChessCNN(nn.Module):
 
         return self.fc2(x)
 
-# ---------------- LAZY MODEL LOAD ----------------
+# ---------------- LOAD MODEL ----------------
 device = torch.device("cpu")
 model = None
 
@@ -62,7 +62,10 @@ def load_model():
     if model is None:
         print("Loading model...")
         model = ChessCNN()
-        model.load_state_dict(torch.load("Model/cnn_v4_final.pth", map_location=device))
+        model.load_state_dict(torch.load(
+            "Model/cnn_v4_final.pth",
+            map_location=device
+        ))
         model.to(device)
         model.eval()
         print("Model loaded")
@@ -103,6 +106,25 @@ def board_to_tensor(board):
 
     return tensor
 
+def get_material(board):
+    my_mat, opp_mat = 0, 0
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece:
+            val = piece_values[piece.piece_type]
+            if piece.color == board.turn:
+                my_mat += val
+            else:
+                opp_mat += val
+    return (my_mat - opp_mat) / 39.0
+
+def king_distance(board):
+    k1 = board.king(board.turn)
+    k2 = board.king(not board.turn)
+    r1, c1 = divmod(k1, 8)
+    r2, c2 = divmod(k2, 8)
+    return (abs(r1 - r2) + abs(c1 - c2)) / 14.0
+
 def get_extra(board, move_history):
     feats = []
 
@@ -117,9 +139,9 @@ def get_extra(board, move_history):
             feats.append(m.from_square / 63.0)
             feats.append(m.to_square / 63.0)
 
-    feats.append(0)
+    feats.append(get_material(board))
     feats.append(1.0 if board.is_check() else 0.0)
-    feats.append(0)
+    feats.append(king_distance(board))
 
     return feats
 
@@ -132,76 +154,145 @@ def evaluate(board, my_color):
         return 0
 
     score = 0
-
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if piece:
             val = piece_values[piece.piece_type]
             score += val if piece.color == my_color else -val
 
+    # mobility
+    my_mobility = len(list(board.legal_moves))
+    board.turn = not board.turn
+    opp_mobility = len(list(board.legal_moves))
+    board.turn = not board.turn
+    score += 0.1 * (my_mobility - opp_mobility)
+
     return score
 
-# ---------------- GET TOP K ----------------
+# ---------------- GET TOP K MOVES ----------------
 def get_top_k_moves(board, move_history, my_color, k=3):
     load_model()
 
-    x = board_to_tensor(board).unsqueeze(0).to(device)
-    e = torch.tensor([get_extra(board, move_history)], dtype=torch.float32).to(device)
+    # mirror if black
+    if my_color == chess.BLACK:
+        board_input = board.mirror()
+        mirrored_history = [
+            chess.Move(
+                chess.square_mirror(m.from_square),
+                chess.square_mirror(m.to_square)
+            ) for m in move_history
+        ]
+    else:
+        board_input = board
+        mirrored_history = move_history
+
+    x = board_to_tensor(board_input).unsqueeze(0).to(device)
+    e = torch.tensor(
+        [get_extra(board_input, mirrored_history)],
+        dtype=torch.float32
+    ).to(device)
 
     with torch.no_grad():
         logits = model(x, e)[0]
 
+    legal_moves = list(board.legal_moves)
     move_scores = []
 
-    for move in board.legal_moves:
-        idx = move.from_square * 64 + move.to_square
-        move_scores.append((move, logits[idx].item()))
+    for move in legal_moves:
+        if my_color == chess.BLACK:
+            mirrored = chess.Move(
+                chess.square_mirror(move.from_square),
+                chess.square_mirror(move.to_square)
+            )
+            idx = mirrored.from_square * 64 + mirrored.to_square
+        else:
+            idx = move.from_square * 64 + move.to_square
+
+        score = logits[idx].item()
+        move_scores.append((move, score))
 
     move_scores.sort(key=lambda x: x[1], reverse=True)
 
     return move_scores[:k]
 
 # ---------------- MINIMAX ----------------
-def minimax(board, depth, maximizing, my_color):
+def minimax(board, depth, maximizing, my_color, alpha, beta):
     if depth == 0 or board.is_game_over():
         return evaluate(board, my_color)
 
+    legal_moves = list(board.legal_moves)
+    legal_moves.sort(key=lambda m: board.is_capture(m), reverse=True)
+
     if maximizing:
-        best = -9999
-        for move in board.legal_moves:
+        best = float('-inf')
+        for move in legal_moves:
             board.push(move)
-            best = max(best, minimax(board, depth - 1, False, my_color))
+            val = minimax(board, depth - 1, False, my_color, alpha, beta)
             board.pop()
+            best = max(best, val)
+            alpha = max(alpha, best)
+            if beta <= alpha:
+                break
         return best
     else:
-        best = 9999
-        for move in board.legal_moves:
+        best = float('inf')
+        for move in legal_moves:
             board.push(move)
-            best = min(best, minimax(board, depth - 1, True, my_color))
+            val = minimax(board, depth - 1, True, my_color, alpha, beta)
             board.pop()
+            best = min(best, val)
+            beta = min(beta, best)
+            if beta <= alpha:
+                break
         return best
 
 # ---------------- PREDICT ----------------
 def predict(board, move_history):
     my_color = board.turn
 
-    top_moves = get_top_k_moves(board, move_history, my_color)
+    top_moves = get_top_k_moves(board, move_history, my_color, k=3)
 
     if not top_moves:
         return None
 
-    best_move = top_moves[0][0]
+    if len(top_moves) == 1:
+        return top_moves[0][0]
 
-    best_score = -9999
+    model_top_move = top_moves[0][0]
 
-    for move, _ in top_moves:
+    CLOSE_THRESHOLD = 2.0
+
+    candidate_results = []
+
+    for move, model_score in top_moves:
         board.push(move)
-        score = minimax(board, 2, False, my_color)
+
+        score_after = minimax(
+            board,
+            depth=2,
+            maximizing=False,
+            my_color=my_color,
+            alpha=float('-inf'),
+            beta=float('inf')
+        )
+
         board.pop()
 
-        if score > best_score:
-            best_score = score
-            best_move = move
+        candidate_results.append((move, model_score, score_after))
+
+    candidate_results.sort(key=lambda x: x[2], reverse=True)
+
+    best_move_by_eval = candidate_results[0][0]
+    best_eval_score = candidate_results[0][2]
+
+    model_top_eval_score = next(
+        r[2] for r in candidate_results if r[0] == model_top_move
+    )
+
+    if model_top_eval_score < best_eval_score - CLOSE_THRESHOLD:
+        best_move = best_move_by_eval
+    else:
+        best_move = model_top_move
 
     return best_move
 
@@ -212,9 +303,18 @@ def get_move(req: MoveRequest):
     move_history = []
 
     for uci in req.moves:
-        move = chess.Move.from_uci(uci)
-        move_history.append(move)
-        board.push(move)
+        try:
+            move = chess.Move.from_uci(uci)
+            move_history.append(move)
+            board.push(move)
+        except Exception as e:
+            print(f"Bad move {uci}: {e}")
+            break
+
+    if board.fen().split(" ")[0] != chess.Board(req.fen).fen().split(" ")[0]:
+        print("FEN mismatch, rebuilding from FEN")
+        board = chess.Board(req.fen)
+        move_history = []
 
     if board.is_game_over():
         return {"move": None}
